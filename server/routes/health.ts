@@ -155,6 +155,32 @@ router.get("/fathom/stats", async (_req, res) => {
   }
 });
 
+// Reset errored transcripts back to pending
+router.post("/fathom/reset-errors", async (_req, res) => {
+  try {
+    const { db, schema } = await import("../../db/index.js");
+    const { eq } = await import("drizzle-orm");
+
+    const errored = db.select().from(schema.fathomTranscripts)
+      .where(eq(schema.fathomTranscripts.status, "error")).all();
+
+    let reset = 0;
+    for (const t of errored as any[]) {
+      db.update(schema.fathomTranscripts)
+        .set({ status: "pending", processedAt: null, errorMessage: null })
+        .where(eq(schema.fathomTranscripts.id, t.id)).run();
+      reset++;
+    }
+
+    const pending = db.select().from(schema.fathomTranscripts)
+      .where(eq(schema.fathomTranscripts.status, "pending")).all().length;
+
+    res.json({ totalErrored: errored.length, reset, nowPending: pending });
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
+  }
+});
+
 router.post("/fathom/poll", async (_req, res) => {
   try {
     const result = await manualPoll();
