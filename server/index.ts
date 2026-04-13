@@ -75,6 +75,6 @@ app.listen(PORT, async () => {
     console.error("[Startup] HubSpot pull failed:", e);
   }
 
-  // Step 2: NOW start the Fathom poller (it has closed-won data to check against)
-  startFathomPoller();
+  // Poller disabled — Claude Code runs the poller externally
+  // startFathomPoller();
 });
