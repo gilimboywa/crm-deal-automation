@@ -31,9 +31,9 @@ export default function DealList() {
   const { data, isLoading, error } = useDeals(search ? { search } : undefined);
   const navigate = useNavigate();
 
-  // Only show deals that Claude actually processed
+  // Only show deals pending review (Claude-processed + not yet approved/rejected)
   const allDeals = data?.deals ?? [];
-  const deals = allDeals.filter((d) => d.claudeReasoning);
+  const deals = allDeals.filter((d) => d.claudeReasoning && d.reviewStatus === "pending");
 
   return (
     <div>
