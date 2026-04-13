@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1775766392621,
+      "tag": "0000_neat_silverclaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1775834344901,
+      "tag": "0001_thick_steve_rogers",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1775836329762,
+      "tag": "0002_powerful_nemesis",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "crm-dev",
+      "runtimeExecutable": "/usr/local/bin/npx",
+      "runtimeArgs": ["concurrently", "npx tsx watch server/index.ts", "npx vite --config client/vite.config.ts"],
+      "port": 5173
+    }
+  ]
+}

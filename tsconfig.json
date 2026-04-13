@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "paths": {
+      "@db/*": ["./db/*"],
+      "@server/*": ["./server/*"]
+    }
+  },
+  "include": ["db/**/*", "server/**/*", "client/src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
