@@ -8,6 +8,9 @@ import {
   createDeal as hubspotCreateDeal,
   updateDeal as hubspotUpdateDeal,
 } from "../services/hubspot-client.js";
+import { routeTranscript, routeEmail, shouldProcess, shouldSkip } from "../services/router.js";
+import { rebuildIndex } from "../services/hubspot-index.js";
+import { normalizeCompany } from "../services/company-matcher.js";
 import type { ProcessingInput } from "../lib/types.js";
 
 const router = Router();
@@ -188,7 +191,7 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-// ── POST /process — Process raw input through Claude → matcher → save → notify ──
+// ── POST /process — Deterministic route → Claude extract → match → save → notify ──
 router.post("/process", async (req, res) => {
   try {
     const input: ProcessingInput = req.body;
@@ -198,13 +201,32 @@ router.post("/process", async (req, res) => {
       return;
     }
 
-    // Step 1: Process through Claude
+    // ── STEP 1: Deterministic routing (NO Claude) ──
+    const title = input.data.title as string || input.data.subject as string || "";
+    if (title) {
+      const routing = input.sourceType === "email"
+        ? routeEmail(title, input.data.senderDomain as string || null)
+        : routeTranscript(title);
+
+      console.log(`[Router] /process "${title}" → ${routing.outcome}: ${routing.reason}`);
+
+      if (shouldSkip(routing)) {
+        res.json({
+          skipped: true,
+          reason: `${routing.outcome}: ${routing.reason}`,
+          routingOutcome: routing.outcome,
+        });
+        return;
+      }
+    }
+
+    // ── STEP 2: Process through Claude (only reaches here if routing passed) ──
     const { dealBox, reasoning } = await processDealData(input);
 
-    // Step 2: Check if this company has deals. Skip ONLY if ALL deals are closed (no active ones).
+    // ── STEP 3: Post-Claude closed-deal verification ──
     const allDeals = await db.select().from(schema.deals);
-    const normalize = (s: string) => s.toLowerCase().trim().replace(/\s*(,?\s*(inc\.?|llc\.?|corp\.?|ltd\.?|co\.?))\s*$/gi, "").trim();
-    const companyDeals = allDeals.filter((d) => normalize(d.companyName) === normalize(dealBox.companyName));
+    const norm = normalizeCompany(dealBox.companyName);
+    const companyDeals = allDeals.filter((d) => normalizeCompany(d.companyName) === norm);
     const hasActiveDeal = companyDeals.some((d) => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost");
     const hasClosedDeal = companyDeals.some((d) => d.dealStage === "closed_won" || d.dealStage === "closed_lost");
 
@@ -212,13 +234,13 @@ router.post("/process", async (req, res) => {
       const closedMatch = companyDeals.find((d) => d.dealStage === "closed_won" || d.dealStage === "closed_lost")!;
       res.json({
         skipped: true,
-        reason: `${dealBox.companyName} is a closed deal (${closedMatch.dealStage === "closed_won" ? "won" : "lost"}, deal #${closedMatch.id}). No active deals. Skipping.`,
+        reason: `SKIP_CLOSED_ONLY (post-Claude): ${dealBox.companyName} is ${closedMatch.dealStage} (deal #${closedMatch.id}). No active deals.`,
         matchedDealId: closedMatch.id,
       });
       return;
     }
 
-    // Step 3: Match against active deals only
+    // ── STEP 4: Match against active deals only ──
     const activeDeals = allDeals.filter(
       (d) => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost"
     );
@@ -386,6 +408,37 @@ router.post("/:id/review", async (req, res) => {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: message });
+  }
+});
+
+// ── POST /route-test — Test the deterministic router without processing ──
+router.post("/route-test", async (req, res) => {
+  try {
+    const { title, sourceType, senderDomain } = req.body;
+    if (!title) {
+      res.status(400).json({ error: "title is required" });
+      return;
+    }
+
+    const routing = sourceType === "email"
+      ? routeEmail(title, senderDomain || null)
+      : routeTranscript(title);
+
+    res.json({ routing });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    res.status(500).json({ error: message });
+  }
+});
+
+// ── POST /rebuild-index — Rebuild the HubSpot index ──
+router.post("/rebuild-index", async (_req, res) => {
+  try {
+    const stats = rebuildIndex();
+    res.json({ success: true, ...stats });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
     res.status(500).json({ error: message });
   }
 });

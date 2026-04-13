@@ -3,6 +3,9 @@ import { db, schema } from "../../db/index.js";
 import { processDealData } from "../services/deal-processor.js";
 import { matchDeal } from "../services/deal-matcher.js";
 import { notifyDealReview } from "../services/slack-notifier.js";
+import { routeTranscript, routeEmail, shouldProcess, shouldSkip } from "../services/router.js";
+import { rebuildIndex } from "../services/hubspot-index.js";
+import { normalizeCompany } from "../services/company-matcher.js";
 import type { ProcessingInput } from "../lib/types.js";
 
 const router = Router();
@@ -19,13 +22,32 @@ router.post("/", async (req, res) => {
       return;
     }
 
-    // Step 1: Process through Claude to extract DealBox
+    // ── STEP 1: Deterministic routing BEFORE Claude ──
+    const title = (input.data.title as string) || (input.data.subject as string) || "";
+    if (title) {
+      const routing = input.sourceType === "email"
+        ? routeEmail(title, (input.data.senderDomain as string) || null)
+        : routeTranscript(title);
+
+      console.log(`[Ingest] "${title}" → ${routing.outcome}: ${routing.reason}`);
+
+      if (shouldSkip(routing)) {
+        res.json({
+          skipped: true,
+          reason: `${routing.outcome}: ${routing.reason}`,
+          routingOutcome: routing.outcome,
+        });
+        return;
+      }
+    }
+
+    // ── STEP 2: Process through Claude (only if routing passed) ──
     const { dealBox, reasoning } = await processDealData(input);
 
-    // Step 2: Skip ONLY if ALL deals for this company are closed (no active ones).
+    // ── STEP 3: Post-Claude closed-deal check ──
     const allDeals = await db.select().from(schema.deals);
-    const normalize = (s: string) => s.toLowerCase().trim().replace(/\s*(,?\s*(inc\.?|llc\.?|corp\.?|ltd\.?|co\.?))\s*$/gi, "").trim();
-    const companyDeals = allDeals.filter((d) => normalize(d.companyName) === normalize(dealBox.companyName));
+    const norm = normalizeCompany(dealBox.companyName);
+    const companyDeals = allDeals.filter((d) => normalizeCompany(d.companyName) === norm);
     const hasActiveDeal = companyDeals.some((d) => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost");
     const hasClosedDeal = companyDeals.some((d) => d.dealStage === "closed_won" || d.dealStage === "closed_lost");
 
@@ -33,7 +55,7 @@ router.post("/", async (req, res) => {
       const closedMatch = companyDeals.find((d) => d.dealStage === "closed_won" || d.dealStage === "closed_lost")!;
       res.json({
         skipped: true,
-        reason: `${dealBox.companyName} is a closed deal (${closedMatch.dealStage === "closed_won" ? "won" : "lost"}, deal #${closedMatch.id}). No active deals. Skipping.`,
+        reason: `SKIP_CLOSED_ONLY (post-Claude): ${dealBox.companyName} is ${closedMatch.dealStage} (deal #${closedMatch.id}).`,
         matchedDealId: closedMatch.id,
       });
       return;

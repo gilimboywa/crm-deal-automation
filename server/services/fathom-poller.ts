@@ -5,6 +5,9 @@ import { processDealData } from "./deal-processor.js";
 import { matchDeal } from "./deal-matcher.js";
 import { notifyDealReview } from "./slack-notifier.js";
 import { db, schema } from "../../db/index.js";
+import { routeTranscript, shouldProcess, shouldSkip, type RoutingDecision } from "./router.js";
+import { rebuildIndex } from "./hubspot-index.js";
+import { normalizeCompany } from "./company-matcher.js";
 
 const PULL_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const PROCESS_DELAY_MS = 15_000; // 15 seconds between Claude calls
@@ -12,17 +15,6 @@ const PROCESS_DELAY_MS = 15_000; // 15 seconds between Claude calls
 let lastPullTime: string | null = null;
 let pullTimer: ReturnType<typeof setInterval> | null = null;
 let processing = false;
-
-// Internal meeting patterns — these are never deals
-const INTERNAL_PATTERNS = [
-  "paid ads", "sales coaching", "team meeting", "implementation weekly",
-  "design team", "marketing kickoff", "engineering", "product", "standup",
-  "sprint", "retro", "all hands", "1:1", "interview", "hiring", "training",
-  "weekly touch base", "weekly touchbase", "biweekly check-in",
-  "monthly touchpoint", "onboarding touchpoint", "winddown weekly",
-  "ubo requirements", "class action", "finovate", "fathom demo",
-  "gomarketmodel", "go market model", "apollo", "golden venture",
-];
 
 function getEisenSpeakers(meeting: FathomMeeting): Array<{ name: string; email: string }> {
   const speakers = new Map<string, { name: string; email: string }>();
@@ -36,65 +28,9 @@ function getEisenSpeakers(meeting: FathomMeeting): Array<{ name: string; email: 
 }
 
 /**
- * Check if a meeting title looks like an internal meeting (not a deal).
- */
-function isInternalMeeting(title: string): boolean {
-  const lower = title.toLowerCase();
-  // Match internal patterns
-  if (INTERNAL_PATTERNS.some(p => lower.includes(p))) return true;
-  // Single-word titles are internal 1:1s
-  if (lower.split(/[\s/\-|]/).filter(Boolean).length <= 1) return true;
-  // No company indicator — not a deal meeting
-  if (!lower.includes("eisen") && !lower.includes("escheatment") && !lower.includes("demo") && !lower.includes("proposal") && !lower.includes("intro")) return true;
-  return false;
-}
-
-/**
- * Check company status in the database.
- * Returns: "closed" | "active" | "new"
- */
-function checkCompanyStatus(title: string, allDeals: any[]): { status: "closed" | "active" | "new"; matchedDeal?: any } {
-  const titleLower = title.toLowerCase();
-  const normalize = (s: string) =>
-    s.toLowerCase().trim().replace(/\s*(,?\s*(inc\.?|llc\.?|corp\.?|ltd\.?|co\.?))\s*$/gi, "").trim();
-
-  // Extract company-like segments from title
-  const segments = titleLower.split(/[|/&<>]/).concat(titleLower.split(" - "))
-    .map(s => s.replace(/eisen/gi, "").trim()).filter(s => s.length > 2);
-
-  // Check each deal for a match
-  let hasActive = false;
-  let hasClosed = false;
-  let activeDeal: any = null;
-  let closedDeal: any = null;
-
-  for (const d of allDeals) {
-    const companyNorm = normalize(d.companyName);
-    if (companyNorm.length <= 2) continue;
-
-    // Check if this deal's company name appears in the title (both directions)
-    const matches = titleLower.includes(companyNorm) ||
-      segments.some(seg => companyNorm.includes(seg) || seg.includes(companyNorm));
-
-    if (!matches) continue;
-
-    if (d.dealStage === "closed_won" || d.dealStage === "closed_lost") {
-      hasClosed = true;
-      closedDeal = d;
-    } else {
-      hasActive = true;
-      activeDeal = d;
-    }
-  }
-
-  // Active deal takes priority over closed
-  if (hasActive) return { status: "active", matchedDeal: activeDeal };
-  if (hasClosed) return { status: "closed", matchedDeal: closedDeal };
-  return { status: "new" };
-}
-
-/**
  * Pull new transcripts from Fathom and store them in the DB.
+ * At this stage we only store — NO routing decisions yet.
+ * Routing happens in processNextPending().
  */
 async function pullTranscripts() {
   console.log("[Fathom] Pulling new transcripts...");
@@ -113,8 +49,8 @@ async function pullTranscripts() {
       if (existing) { skipped++; continue; }
 
       const eisenSpeakers = getEisenSpeakers(meeting);
-      const internal = isInternalMeeting(meeting.title);
 
+      // Store with status "pending" — routing happens later
       await db.insert(schema.fathomTranscripts).values({
         recordingId: meeting.recording_id,
         title: meeting.title,
@@ -125,19 +61,15 @@ async function pullTranscripts() {
         recordingEnd: meeting.recording_end_time,
         transcript: JSON.stringify(meeting.transcript || []),
         eisenSpeakers: JSON.stringify(eisenSpeakers),
-        isSalesCall: !internal,
+        isSalesCall: false,  // Will be set by router
         salesPerson: null,
-        status: internal ? "skipped" : "pending",
-        errorMessage: internal ? "Internal meeting" : null,
+        status: "pending",
+        errorMessage: null,
         pulledAt: new Date().toISOString(),
       });
 
       stored++;
-      if (internal) {
-        console.log(`[Fathom] Stored & skipped (internal): "${meeting.title}"`);
-      } else {
-        console.log(`[Fathom] Stored: "${meeting.title}"`);
-      }
+      console.log(`[Fathom] Stored: "${meeting.title}"`);
     }
 
     lastPullTime = new Date().toISOString();
@@ -148,12 +80,15 @@ async function pullTranscripts() {
 }
 
 /**
- * Process the next pending transcript.
- * The logic:
- * 1. Check company against database (closed? active? new?)
- * 2. Closed (no active deal) → skip
- * 3. Active deal exists → process as UPDATE
- * 4. No deal exists → process as NEW
+ * Process the next pending transcript using the DETERMINISTIC ROUTER.
+ *
+ * Flow:
+ * 1. Pick next pending transcript
+ * 2. Run deterministic router (NO Claude involved)
+ * 3. If SKIP_* → mark as skipped, done
+ * 4. If REVIEW_AMBIGUOUS → mark for review, done
+ * 5. If PROCESS_ACTIVE or PROCESS_NEW → send to Claude for field extraction
+ * 6. Claude extracts Deal Box → save to deals table → Slack notification
  */
 async function processNextPending() {
   if (processing) return;
@@ -165,24 +100,47 @@ async function processNextPending() {
   processing = true;
 
   try {
-    const allDeals = await db.select().from(schema.deals);
-    const companyCheck = checkCompanyStatus(pending.title, allDeals);
+    // ── STEP 1: Deterministic routing (NO Claude) ──
+    const routing: RoutingDecision = routeTranscript(pending.title);
+    console.log(`[Router] "${pending.title}" → ${routing.outcome}: ${routing.reason}`);
 
-    // CLOSED (no active deal) → skip entirely
-    if (companyCheck.status === "closed") {
+    // ── STEP 2: Handle SKIP outcomes ──
+    if (shouldSkip(routing)) {
       db.update(schema.fathomTranscripts)
-        .set({ status: "skipped", processedAt: new Date().toISOString(), errorMessage: `Closed: ${companyCheck.matchedDeal.companyName} (${companyCheck.matchedDeal.dealStage})` })
+        .set({
+          status: "skipped",
+          processedAt: new Date().toISOString(),
+          errorMessage: `${routing.outcome}: ${routing.reason}`,
+          isSalesCall: false,
+        })
         .where(eq(schema.fathomTranscripts.id, pending.id)).run();
-      console.log(`[Fathom] Skipped "${pending.title}" — ${companyCheck.matchedDeal.companyName} is ${companyCheck.matchedDeal.dealStage}`);
+
+      console.log(`[Fathom] Skipped "${pending.title}" — ${routing.outcome}`);
       processing = false;
       return;
     }
 
-    // ACTIVE or NEW → process through Claude
-    console.log(`[Fathom] Processing: "${pending.title}" (${companyCheck.status})`);
+    // ── STEP 3: Handle REVIEW_AMBIGUOUS ──
+    if (routing.outcome === "REVIEW_AMBIGUOUS") {
+      db.update(schema.fathomTranscripts)
+        .set({
+          status: "skipped",
+          processedAt: new Date().toISOString(),
+          errorMessage: `REVIEW_AMBIGUOUS: ${routing.reason}`,
+          isSalesCall: true,
+        })
+        .where(eq(schema.fathomTranscripts.id, pending.id)).run();
+
+      console.log(`[Fathom] Flagged for review: "${pending.title}" — ${routing.reason}`);
+      processing = false;
+      return;
+    }
+
+    // ── STEP 4: PROCESS_ACTIVE or PROCESS_NEW → Claude extraction ──
+    console.log(`[Fathom] Processing: "${pending.title}" (${routing.outcome})`);
 
     db.update(schema.fathomTranscripts)
-      .set({ status: "processing" })
+      .set({ status: "processing", isSalesCall: true })
       .where(eq(schema.fathomTranscripts.id, pending.id)).run();
 
     const transcript = JSON.parse(pending.transcript);
@@ -199,28 +157,39 @@ async function processNextPending() {
       },
     });
 
-    // After Claude extracts company name, double-check against closed deals
-    const normalize = (s: string) =>
-      s.toLowerCase().trim().replace(/\s*(,?\s*(inc\.?|llc\.?|corp\.?|ltd\.?|co\.?))\s*$/gi, "").trim();
-
-    const companyDeals = allDeals.filter(d => normalize(d.companyName) === normalize(dealBox.companyName));
-    const hasActiveDeal = companyDeals.some(d => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost");
+    // ── STEP 5: Post-Claude verification ──
+    // Double-check the company Claude extracted against closed deals
+    const allDeals = await db.select().from(schema.deals);
+    const norm = normalizeCompany(dealBox.companyName);
+    const companyDeals = allDeals.filter(
+      (d) => normalizeCompany(d.companyName) === norm
+    );
+    const hasActiveDeal = companyDeals.some(
+      (d) => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost"
+    );
     const hasClosedOnly = companyDeals.length > 0 && !hasActiveDeal;
 
     if (hasClosedOnly) {
       db.update(schema.fathomTranscripts)
-        .set({ status: "skipped", processedAt: new Date().toISOString(), errorMessage: `Closed after Claude extract: ${dealBox.companyName}` })
+        .set({
+          status: "skipped",
+          processedAt: new Date().toISOString(),
+          errorMessage: `SKIP_CLOSED_ONLY (post-Claude): ${dealBox.companyName}`,
+        })
         .where(eq(schema.fathomTranscripts.id, pending.id)).run();
-      console.log(`[Fathom] Skipped "${dealBox.companyName}" — closed (caught after Claude)`);
+
+      console.log(`[Fathom] Skipped "${dealBox.companyName}" — closed (caught post-Claude)`);
       processing = false;
       return;
     }
 
-    // Match against active deals only
-    const activeDeals = allDeals.filter(d => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost");
+    // ── STEP 6: Match against active deals only ──
+    const activeDeals = allDeals.filter(
+      (d) => d.dealStage !== "closed_won" && d.dealStage !== "closed_lost"
+    );
     const matchResult = matchDeal(dealBox, activeDeals);
 
-    // Save deal to review
+    // ── STEP 7: Save deal to review ──
     const [savedDeal] = await db.insert(schema.deals).values({
       companyName: dealBox.companyName,
       amount: dealBox.amount,
@@ -255,6 +224,8 @@ async function processNextPending() {
         title: pending.title,
         recording_id: pending.recordingId,
         url: pending.meetingUrl,
+        routingOutcome: routing.outcome,
+        routingReason: routing.reason,
       }),
       claudeReasoning: reasoning,
       createdAt: new Date().toISOString(),
@@ -288,6 +259,9 @@ async function processNextPending() {
       .set({ status: "processed", dealId: savedDeal.id, processedAt: new Date().toISOString() })
       .where(eq(schema.fathomTranscripts.id, pending.id)).run();
 
+    // Rebuild index after new deal
+    rebuildIndex();
+
     // Notify Slack
     try {
       await notifyDealReview(savedDeal, matchResult);
@@ -317,6 +291,7 @@ async function processNextPending() {
 
 /**
  * Start the Fathom system.
+ * IMPORTANT: rebuildIndex() must be called BEFORE this (done in server/index.ts after HubSpot pull).
  */
 export function startFathomPoller() {
   const existingCount = db.select().from(schema.fathomTranscripts).all().length;

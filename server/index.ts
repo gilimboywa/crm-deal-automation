@@ -2,6 +2,7 @@ import "./env.js";
 import app from "./app.js";
 import { getAllDeals } from "./services/hubspot-client.js";
 import { startFathomPoller } from "./services/fathom-poller.js";
+import { rebuildIndex, getIndexStats } from "./services/hubspot-index.js";
 import { db, schema } from "../db/index.js";
 import { eq } from "drizzle-orm";
 
@@ -73,6 +74,16 @@ app.listen(PORT, async () => {
     console.log(`[Startup] HubSpot: ${hubspotDeals.length} deals (${created} created, ${updated} updated)`);
   } catch (e) {
     console.error("[Startup] HubSpot pull failed:", e);
+  }
+
+  // Step 2: Build the deterministic routing index AFTER HubSpot data is loaded
+  try {
+    const stats = rebuildIndex();
+    console.log(`[Startup] HubSpot Index: ${stats.totalDeals} deals, ${stats.companies} companies`);
+    const indexStats = getIndexStats();
+    console.log(`[Startup] Index breakdown: ${indexStats.activeCompanies} active, ${indexStats.closedOnlyCompanies} closed-only`);
+  } catch (e) {
+    console.error("[Startup] Index build failed:", e);
   }
 
   // Poller disabled — Claude Code runs the poller externally
