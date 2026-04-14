@@ -8,7 +8,7 @@ import {
   createDeal as hubspotCreateDeal,
   updateDeal as hubspotUpdateDeal,
 } from "../services/hubspot-client.js";
-import { routeTranscript, routeEmail, shouldProcess, shouldSkip } from "../services/router.js";
+import { routeTranscript, routeEmail, shouldProcess, shouldSkip, extractDomainFromFrom } from "../services/router.js";
 import { rebuildIndex } from "../services/hubspot-index.js";
 import { normalizeCompany } from "../services/company-matcher.js";
 import type { ProcessingInput } from "../lib/types.js";
@@ -204,8 +204,12 @@ router.post("/process", async (req, res) => {
     // ── STEP 1: Deterministic routing (NO Claude) ──
     const title = input.data.title as string || input.data.subject as string || "";
     if (title) {
+      const senderInfo = (input.data.senderDomain as string)
+        || (input.data.from as string)
+        || null;
+
       const routing = input.sourceType === "email"
-        ? routeEmail(title, input.data.senderDomain as string || null)
+        ? routeEmail(title, senderInfo)
         : routeTranscript(title);
 
       console.log(`[Router] /process "${title}" → ${routing.outcome}: ${routing.reason}`);

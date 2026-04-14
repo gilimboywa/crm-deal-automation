@@ -13,7 +13,7 @@ import {
   compareCompanies,
   extractCompaniesFromTitle,
 } from "../company-matcher.js";
-import { routeTranscript, routeEmail, shouldProcess, shouldSkip } from "../router.js";
+import { routeTranscript, routeEmail, shouldProcess, shouldSkip, extractDomainFromFrom } from "../router.js";
 
 // ──────────────────────────────────────────────
 // 1. Company Matcher — normalizeCompany
@@ -192,6 +192,74 @@ describe("routeTranscript — regressions", () => {
   it("SKIP_INTERNAL: email from eisen domain", () => {
     const result = routeEmail("Re: WaFd proposal", "witheisen.com");
     expect(result.outcome).toBe("SKIP_INTERNAL");
+  });
+
+  // ── EMAIL VENDOR REGRESSIONS (from n8n email workflow failures) ──
+
+  it("SKIP_VENDOR_TOOL: Replit support email", () => {
+    const result = routeEmail("Your Replit API token", "Replit Support <support@replit.com>");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: Anthropic email", () => {
+    const result = routeEmail("API usage update", "Anthropic <noreply@anthropic.com>");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: Apollo.io email", () => {
+    const result = routeEmail("New leads available", "Apollo <notifications@apollo.io>");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: HubSpot notification", () => {
+    const result = routeEmail("Deal update", "notifications@hubspot.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: Slack notification", () => {
+    const result = routeEmail("New message", "noreply@slack.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: GitHub notification", () => {
+    const result = routeEmail("PR merged", "notifications@github.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: Gmail/Google email", () => {
+    const result = routeEmail("Security alert", "no-reply@accounts.google.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: subscription/newsletter subject", () => {
+    const result = routeEmail("Unsubscribe from our newsletter", "info@somecompany.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+
+  it("SKIP_VENDOR_TOOL: DAS London (not a financial institution)", () => {
+    const result = routeEmail("Lowest pricing for DAS London", "sales@daslondon.com");
+    expect(result.outcome).toBe("SKIP_VENDOR_TOOL");
+  });
+});
+
+// ──────────────────────────────────────────────
+// 5b. extractDomainFromFrom
+// ──────────────────────────────────────────────
+describe("extractDomainFromFrom", () => {
+  it("extracts domain from 'Name <email>' format", () => {
+    expect(extractDomainFromFrom("Replit Support <support@replit.com>")).toBe("replit.com");
+  });
+
+  it("extracts domain from bare email", () => {
+    expect(extractDomainFromFrom("support@replit.com")).toBe("replit.com");
+  });
+
+  it("extracts domain from complex format", () => {
+    expect(extractDomainFromFrom("\"Anthropic, PBC\" <billing@anthropic.com>")).toBe("anthropic.com");
+  });
+
+  it("returns null for empty", () => {
+    expect(extractDomainFromFrom("")).toBeNull();
   });
 });
 

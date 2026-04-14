@@ -55,10 +55,58 @@ const INTERNAL_PATTERNS = [
 ];
 
 // ── Vendor/tool patterns (not prospects) ──
+// Eisen does unclaimed property/escheatment for financial institutions.
+// Any company that is NOT a bank, credit union, fintech, or insurance company
+// is almost certainly a vendor, tool, or irrelevant email.
 const VENDOR_PATTERNS = [
+  // Dev tools & hosting
   "hubspot", "salesforce", "zapier", "n8n", "slack", "notion",
   "figma", "linear", "jira", "confluence", "asana", "monday.com",
   "aws", "azure", "google cloud", "stripe", "plaid",
+  "replit", "vercel", "netlify", "heroku", "railway", "render",
+  "github", "gitlab", "bitbucket",
+  // AI/ML tools
+  "anthropic", "openai", "claude", "chatgpt",
+  // Sales/marketing tools
+  "clay", "apollo.io", "outreach", "salesloft", "gong",
+  "mailchimp", "sendgrid", "twilio", "intercom", "zendesk",
+  // Analytics & misc
+  "posthog", "mixpanel", "amplitude", "segment", "datadog",
+  "pagerduty", "sentry",
+  // Generic non-financial
+  "das london", "senders pediatrics", "medical imaging", "janitek",
+];
+
+// ── Vendor/tool DOMAINS — skip emails from these domains ──
+const VENDOR_DOMAINS = [
+  // Eisen's own domains
+  "witheisen.com", "eisen.com",
+  // Dev tools & hosting
+  "replit.com", "github.com", "vercel.com", "netlify.com",
+  "railway.app", "render.com", "heroku.com",
+  // AI/ML
+  "anthropic.com", "openai.com",
+  // Sales/marketing tools
+  "hubspot.com", "salesforce.com", "clay.com", "apollo.io",
+  "gong.io", "outreach.io", "salesloft.com",
+  "mailchimp.com", "sendgrid.net", "twilio.com",
+  "intercom.io", "zendesk.com",
+  // Platforms
+  "slack.com", "notion.so", "figma.com", "linear.app",
+  "atlassian.net", "asana.com", "monday.com",
+  // Cloud
+  "amazonaws.com", "azure.com", "google.com", "googleapis.com",
+  // Analytics
+  "posthog.com", "mixpanel.com", "amplitude.com", "segment.com",
+  "datadog.com", "pagerduty.com", "sentry.io",
+  // Payments (Eisen uses these, not prospects of)
+  "stripe.com", "plaid.com", "braintreepayments.com",
+  // Calendar / scheduling / notifications
+  "calendly.com", "zoom.us", "fathom.video",
+  "linkedin.com", "facebook.com", "twitter.com",
+  // Generic email
+  "gmail.com", "outlook.com", "yahoo.com", "hotmail.com",
+  "noreply", "no-reply", "donotreply",
 ];
 
 /**
@@ -181,11 +229,47 @@ export function routeTranscript(title: string): RoutingDecision {
 }
 
 /**
- * Route an email subject + sender domain to a deterministic outcome.
- * Similar to routeTranscript but uses email-specific heuristics.
+ * Extract domain from a "from" field.
+ * Handles formats like: "Replit Support <support@replit.com>", "support@replit.com"
  */
-export function routeEmail(subject: string, senderDomain: string | null): RoutingDecision {
-  // Skip Eisen-internal emails
+export function extractDomainFromFrom(from: string): string | null {
+  if (!from) return null;
+  const match = from.match(/<([^>]+)>/) || from.match(/([^\s<]+@[^\s>]+)/);
+  const email = match ? match[1].toLowerCase() : from.toLowerCase();
+  const domain = email.split("@")[1];
+  return domain || null;
+}
+
+/**
+ * Check if a domain belongs to a vendor/tool (not a financial institution prospect).
+ *
+ * Eisen's prospects are: banks, credit unions, fintechs, insurance companies.
+ * Everything else is a vendor, tool, or irrelevant.
+ */
+function isVendorDomain(domain: string): boolean {
+  if (!domain) return false;
+  const d = domain.toLowerCase();
+  return VENDOR_DOMAINS.some((vd) => d.includes(vd) || d.endsWith(vd));
+}
+
+/**
+ * Route an email to a deterministic outcome.
+ *
+ * Accepts EITHER a pre-extracted senderDomain OR a raw "from" field.
+ * The n8n workflow sends from: "Replit Support <support@replit.com>"
+ * so we need to parse the domain ourselves.
+ */
+export function routeEmail(
+  subject: string,
+  senderDomainOrFrom: string | null
+): RoutingDecision {
+  // Extract domain — handle both "replit.com" and "Support <x@replit.com>" formats
+  let senderDomain = senderDomainOrFrom;
+  if (senderDomainOrFrom && senderDomainOrFrom.includes("@")) {
+    senderDomain = extractDomainFromFrom(senderDomainOrFrom);
+  }
+
+  // ── Step 1: Skip Eisen-internal emails ──
   if (senderDomain && (senderDomain.includes("eisen") || senderDomain.includes("witheisen"))) {
     return {
       outcome: "SKIP_INTERNAL",
@@ -196,20 +280,65 @@ export function routeEmail(subject: string, senderDomain: string | null): Routin
     };
   }
 
-  // Extract company from domain if available
-  const candidates: string[] = [];
-  if (senderDomain) {
-    const domainName = senderDomain.replace(/\.(com|org|net|io|co|ai|us|bank)$/i, "").trim();
-    if (domainName.length > 2) {
-      candidates.push(normalizeCompany(domainName));
+  // ── Step 2: Skip vendor/tool domains ──
+  if (senderDomain && isVendorDomain(senderDomain)) {
+    return {
+      outcome: "SKIP_VENDOR_TOOL",
+      reason: `Vendor/tool email from ${senderDomain} — not a financial institution prospect`,
+      companyName: null,
+      matchedRecord: null,
+      candidates: [],
+    };
+  }
+
+  // ── Step 3: Skip no-reply / notification emails ──
+  const subjectLower = subject.toLowerCase();
+  const noReplyPatterns = [
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "unsubscribe", "newsletter", "digest", "notification",
+    "password reset", "verify your", "welcome to", "confirm your",
+    "invoice", "receipt", "payment confirmation", "subscription",
+    "out of office", "ooo", "auto-reply", "automatic reply",
+    "calendar:", "invitation:", "accepted:", "declined:", "tentative:",
+    "support ticket", "ticket update", "case #",
+  ];
+  if (noReplyPatterns.some((p) => subjectLower.includes(p))) {
+    return {
+      outcome: "SKIP_VENDOR_TOOL",
+      reason: `Automated/notification email: "${subject}"`,
+      companyName: null,
+      matchedRecord: null,
+      candidates: [],
+    };
+  }
+
+  // ── Step 4: Check subject against vendor patterns ──
+  for (const pattern of VENDOR_PATTERNS) {
+    if (subjectLower.includes(pattern)) {
+      return {
+        outcome: "SKIP_VENDOR_TOOL",
+        reason: `Subject matches vendor pattern: "${pattern}"`,
+        companyName: null,
+        matchedRecord: null,
+        candidates: [],
+      };
     }
   }
 
-  // Also extract from subject
+  // ── Step 5: Extract company from domain + subject ──
+  const candidates: string[] = [];
+  if (senderDomain) {
+    const domainRoot = senderDomain
+      .replace(/\.(com|org|net|io|co|ai|us|bank|credit|financial)$/i, "")
+      .trim();
+    if (domainRoot.length > 2) {
+      candidates.push(normalizeCompany(domainRoot));
+    }
+  }
+
   const subjectCandidates = extractCompaniesFromTitle(subject);
   candidates.push(...subjectCandidates);
 
-  // Deduplicate
   const uniqueCandidates = [...new Set(candidates.filter(Boolean))];
 
   if (uniqueCandidates.length === 0) {
@@ -222,7 +351,7 @@ export function routeEmail(subject: string, senderDomain: string | null): Routin
     };
   }
 
-  // Look up in index
+  // ── Step 6: Look up in HubSpot index ──
   const lookup = lookupFromTitle(uniqueCandidates);
 
   if (!lookup) {

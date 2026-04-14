@@ -3,7 +3,7 @@ import { db, schema } from "../../db/index.js";
 import { processDealData } from "../services/deal-processor.js";
 import { matchDeal } from "../services/deal-matcher.js";
 import { notifyDealReview } from "../services/slack-notifier.js";
-import { routeTranscript, routeEmail, shouldProcess, shouldSkip } from "../services/router.js";
+import { routeTranscript, routeEmail, shouldProcess, shouldSkip, extractDomainFromFrom } from "../services/router.js";
 import { rebuildIndex } from "../services/hubspot-index.js";
 import { normalizeCompany } from "../services/company-matcher.js";
 import type { ProcessingInput } from "../lib/types.js";
@@ -25,8 +25,14 @@ router.post("/", async (req, res) => {
     // ── STEP 1: Deterministic routing BEFORE Claude ──
     const title = (input.data.title as string) || (input.data.subject as string) || "";
     if (title) {
+      // For emails: extract domain from the "from" field that n8n sends
+      // n8n format: "Replit Support <support@replit.com>" or just "support@replit.com"
+      const senderInfo = (input.data.senderDomain as string)
+        || (input.data.from as string)
+        || null;
+
       const routing = input.sourceType === "email"
-        ? routeEmail(title, (input.data.senderDomain as string) || null)
+        ? routeEmail(title, senderInfo)
         : routeTranscript(title);
 
       console.log(`[Ingest] "${title}" → ${routing.outcome}: ${routing.reason}`);
